@@ -87,9 +87,11 @@ fixed in the script; no argument or environment variable can change it.
   slower while it is rebuilt.
 - **A job instead of a setting.** As far as we found there is no supported size cap, environment variable or
   `defaults` key for this cache. If one exists, we did not find it.
-- **What fills it.** On the example machine, the diag reports' stack samples pointed to `xctest` runs on freshly
-  built test binaries as the main clients: every new build has new symbols to cache. That is one machine's evidence,
-  read from its reports.
+- **What fills it.** On the example machine, the reports' "On Behalf Of" lines name the client processes the daemon
+  wrote for. `xctest` (test runs on freshly built binaries) appeared in 6 of 7 reports, with `spindump` and `sample`
+  in a few; most client pids were short-lived and listed as UNKNOWN, so this is a strong hint, not proof. The
+  daemon's own stack shows it serializing symbol archives that clients send it, so every new build plausibly adds
+  new entries. That is one machine's evidence.
 - **A root-owned copy, with its folders checked.** A root job must never run a file a normal user can replace, or
   that user could run code as root. So `install` copies the script to `/usr/local/libexec` as root:wheel 755 and the
   job runs that copy, never the one you downloaded. Before copying, it checks that `/usr/local/libexec`,
@@ -105,7 +107,7 @@ fixed in the script; no argument or environment variable can change it.
 
 ## What has NOT been verified
 
-- **macOS versions.** Written on one Mac running macOS 27. Other versions are untested; the cache path
+- **macOS versions.** Written and run on one Mac (macOS 27.3 beta, build 26C5035r). Other versions are untested; the cache path
   or its behaviour may differ.
 - **SIP.** We have not checked how System Integrity Protection, on or off, affects deleting inside this folder.
   If SIP blocks it, the job fails and writes the error to the log.
