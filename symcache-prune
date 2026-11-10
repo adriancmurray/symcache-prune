@@ -84,16 +84,21 @@ need_root() {
   exit 1
 }
 
-# safe_ancestors: fails unless every folder above the installed copy is root-owned and not group- or world-writable.
-safe_ancestors() {
-  local d
-  for d in ${libexec:h} /usr/local /usr; do
-    if [[ $(stat -f %u $d) != 0 ]] || (( $(stat -f %Lp $d) & 8#022 )); then
+# safe_dirs <uid> <dir...>: fails unless every dir is owned by uid and not group- or world-writable. stat prints the
+# mode as octal digits, so it is read as base 8.
+safe_dirs() {
+  local uid=$1 d mode; shift
+  for d in "$@"; do
+    mode=$(stat -f %Lp "$d") || return 1
+    if [[ $(stat -f %u "$d") != $uid ]] || (( 8#$mode & 8#022 )); then
       print -u2 "symcache-prune: refusing: $d is not root-owned or is writable by others"
       return 1
     fi
   done
 }
+
+# safe_ancestors: fails unless every folder above the installed copy is root-owned and not group- or world-writable.
+safe_ancestors() { safe_dirs 0 ${libexec:h} /usr/local /usr; }
 
 # do_install [threshold-gb]: copies this script to a root-owned path and loads the hourly job.
 do_install() {

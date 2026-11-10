@@ -101,6 +101,15 @@ if (( EUID != 0 )); then
   check "status without root: exit 0" test $rc -eq 0
   check "status without root: prints sudo du" eval '[[ $out == *"sudo du -sh"* ]]'
 fi
+# safe_dirs reads stat's octal mode: 755 passes, group- or world-writable fails (755 & 022 in decimal would wrongly fail).
+sd=$(mktemp -d); mkdir -p $sd/ok $sd/gw $sd/ow; chmod 755 $sd/ok; chmod 775 $sd/gw; chmod 757 $sd/ow
+check "safe_dirs: 755 owned by uid passes" safe_dirs $UID $sd/ok
+check "safe_dirs: group-writable refused" eval '! safe_dirs $UID $sd/gw 2>/dev/null'
+check "safe_dirs: world-writable refused" eval '! safe_dirs $UID $sd/ow 2>/dev/null'
+check "safe_dirs: wrong owner refused" eval '! safe_dirs 0 $sd/ok 2>/dev/null'
+check "safe_ancestors: passes on root-owned 755 /usr" safe_dirs 0 /usr
+rm -rf $sd
+
 check "changed nothing on the system" test "$before" = "$(state)"
 
 (( failures == 0 )) && print "all passed" || print "$failures failed"
