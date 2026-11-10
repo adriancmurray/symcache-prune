@@ -1,4 +1,5 @@
 #!/bin/zsh -f
+PATH=/usr/bin:/bin:/usr/sbin:/sbin; export PATH  # a root job, and sudo keeps the caller's PATH: use only system binaries
 # symcache-prune: keeps macOS's coresymbolicationd cache from filling the disk.
 #   symcache-prune run [threshold-gb]       prune once if the cache is at or above the threshold (default 10); launchd calls this
 #   sudo symcache-prune install [threshold-gb]   install or reinstall the hourly launchd job
@@ -156,7 +157,7 @@ if [[ $ZSH_EVAL_CONTEXT == toplevel ]]; then
   cmd=$1; (( $# )) && shift
   case $cmd in
     run|install)
-      if [[ $# -gt 1 || ( -n $1 && $1 != <1-> ) ]]; then usage; exit 2; fi ;;
+      if [[ $# -gt 1 || ( -n $1 && $1 != <1-100000> ) ]]; then usage; exit 2; fi ;;
     uninstall|status|check)
       if (( $# )); then usage; exit 2; fi ;;
     *) usage; exit 2 ;;
