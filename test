@@ -1,0 +1,107 @@
+#!/bin/zsh
+# test: checks symcache-prune in a temp dir; touches no system path and needs no root.
+#   zsh test
+# Sources symcache_prune and calls it with a temp cache dir and temp log, then runs the subcommands' argument checks.
+# Prints ok or FAIL per case; exit 0 when all pass.
+
+here=${0:A:h}
+script=$here/symcache-prune
+source $script
+tmp=$(mktemp -d "${TMPDIR:-/tmp}/test-symcache-prune.XXXXXX") || exit 1
+trap 'rm -rf -- $tmp' EXIT
+failures=0
+
+# check <name> <condition...>: reports one case.
+check() {
+  local name=$1; shift
+  if "$@"; then print "ok   $name"; else print "FAIL $name"; (( failures++ )); fi
+}
+
+# fill <dir>: makes a cache dir with a 256 KB `data` file and a subfolder, like the real one.
+fill() {
+  mkdir -p $1/sub
+  dd if=/dev/zero of=$1/data bs=1024 count=256 2>/dev/null
+  print hello > $1/sub/file
+}
+
+size_kb() { print ${$(du -skx -- $1)[1]}; }
+
+# exits_with <code> <args...>: runs the script with <args> and checks its exit code.
+exits_with() {
+  local want=$1; shift
+  zsh $script "$@" >/dev/null 2>&1
+  test $? -eq $want
+}
+
+cache=$tmp/cache; tlog=$tmp/prune.log
+fill $cache
+symcache_prune $cache 999999999 $tlog; rc=$?
+check "below threshold: exit 0" test $rc -eq 0
+check "below threshold: data kept" test -f $cache/data -a -f $cache/sub/file
+check "below threshold: no log line" test ! -e $tlog
+
+fill $cache
+at=$(size_kb $cache)
+symcache_prune $cache $at $tlog; rc=$?
+check "at threshold: exit 0" test $rc -eq 0
+check "at threshold: directory kept" test -d $cache -a ! -L $cache
+check "at threshold: contents deleted" test -z "$(ls -A $cache)"
+check "at threshold: one log line" test "$(wc -l < $tlog | tr -d ' ')" = 1
+line=$(<$tlog)
+check "log line format" eval '[[ $line == <->-<->-<->T<->:<->:<->Z\ before=<->MB\ freed=<->MB ]]'
+
+rm -f $tlog; fill $cache
+symcache_prune $cache 1 $tlog; rc=$?
+check "above threshold: contents deleted" test $rc -eq 0 -a -z "$(ls -A $cache)"
+
+fill $tmp/target
+ln -s $tmp/target $tmp/link
+symcache_prune $tmp/link 1 $tlog 2>/dev/null; rc=$?
+check "symlink refused" test $rc -eq 2
+check "symlink target untouched" test -f $tmp/target/data
+
+print notadir > $tmp/file
+symcache_prune $tmp/file 1 $tlog 2>/dev/null; rc=$?
+check "non-directory refused" test $rc -eq 2 -a -f $tmp/file
+symcache_prune $tmp/missing 1 $tlog 2>/dev/null; rc=$?
+check "missing path refused" test $rc -eq 2
+
+render_plist 7 > $tmp/seven.plist
+check "plist with threshold lints" plutil -lint -s $tmp/seven.plist
+check "plist passes run and threshold" grep -q '<string>run</string>' $tmp/seven.plist
+check "plist has threshold 7" grep -q '<string>7</string>' $tmp/seven.plist
+check "plist label" grep -q '<string>local.symcache-prune</string>' $tmp/seven.plist
+render_plist > $tmp/default.plist
+check "plist without threshold lints" plutil -lint -s $tmp/default.plist
+check "plist without threshold has 2 arguments" test "$(grep -c '^    <string>' $tmp/default.plist)" = 2
+
+# Usage and argument errors exit 2 before any root check or system change.
+state() { ls -ld $plist $libexec $log 2>&1; }
+before=$(state)
+check "no subcommand: usage" exits_with 2
+check "unknown subcommand: usage" exits_with 2 frobnicate
+check "run 0 refused" exits_with 2 run 0
+check "run abc refused" exits_with 2 run abc
+check "run 1.5 refused" exits_with 2 run 1.5
+check "run with two arguments refused" exits_with 2 run 5 6
+check "install 0 refused" exits_with 2 install 0
+check "install with two arguments refused" exits_with 2 install 5 6
+check "uninstall with argument refused" exits_with 2 uninstall 5
+check "status with argument refused" exits_with 2 status x
+check "check with argument refused" exits_with 2 check x
+check "check: exit 0" exits_with 0 check
+out=$(zsh $script check 2>&1)
+check "check: prints sudo du" eval '[[ $out == *"sudo du -sh /System/Library/Caches/com.apple.coresymbolicationd"* ]]'
+if (( EUID != 0 )); then
+  check "install refuses without root" exits_with 1 install
+  check "uninstall refuses without root" exits_with 1 uninstall
+  out=$(zsh $script install 4 2>&1)
+  check "install hint names sudo and the threshold" eval '[[ $out == *"sudo $script install 4"* ]]'
+  out=$(zsh $script status 2>&1); rc=$?
+  check "status without root: exit 0" test $rc -eq 0
+  check "status without root: prints sudo du" eval '[[ $out == *"sudo du -sh"* ]]'
+fi
+check "changed nothing on the system" test "$before" = "$(state)"
+
+(( failures == 0 )) && print "all passed" || print "$failures failed"
+(( failures == 0 ))

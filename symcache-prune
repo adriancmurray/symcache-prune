@@ -1,0 +1,172 @@
+#!/bin/zsh -f
+# symcache-prune: keeps macOS's coresymbolicationd cache from filling the disk.
+#   symcache-prune run [threshold-gb]       prune once if the cache is at or above the threshold (default 10); launchd calls this
+#   sudo symcache-prune install [threshold-gb]   install or reinstall the hourly launchd job
+#   sudo symcache-prune uninstall           unload the job and remove the plist, the installed copy and the log
+#   symcache-prune status                   show whether the job is loaded and the last 5 log lines
+#   symcache-prune check                    print the command that shows the cache size
+# The cache path is fixed on purpose: the job runs as root, so no environment variable or argument may point it
+# elsewhere. `run` deletes the folder's contents (the folder stays) and appends one line to the log:
+# `<ISO time> before=<MB>MB freed=<MB>MB`. Below the threshold it logs nothing.
+# Exit codes: 0 ok, 1 failure or not root, 2 bad arguments or a cache path that is a symlink or not a directory.
+# Tests: zsh test (sources this file with a temp dir).
+
+cache=/System/Library/Caches/com.apple.coresymbolicationd
+label=local.symcache-prune
+plist=/Library/LaunchDaemons/$label.plist
+libexec=/usr/local/libexec/symcache-prune
+log=/var/log/symcache-prune.log
+# FUNCTION_ARGZERO makes $0 the function name inside functions, so capture the script path here.
+self=${0:A}
+
+# symcache_prune <dir> <threshold-kb> <log-file>: prunes <dir> when `du -skx` reports at least <threshold-kb>.
+# Returns 2 when <dir> is a symlink or not a directory, 1 when measuring or deleting fails, else 0.
+symcache_prune() {
+  local dir=$1 threshold_kb=$2 log=$3 before after
+  if [[ -L $dir ]]; then
+    print -u2 "symcache-prune: refusing $dir: it is a symlink"
+    return 2
+  fi
+  if [[ ! -d $dir ]]; then
+    print -u2 "symcache-prune: refusing $dir: not a directory"
+    return 2
+  fi
+  before=${$(du -skx -- "$dir")[1]}
+  [[ $before == <-> ]] || { print -u2 "symcache-prune: could not measure $dir"; return 1; }
+  (( before >= threshold_kb )) || return 0
+  # -x and -mindepth 1 keep the directory itself and stay on its volume; rm removes symlinks, never their targets.
+  find -x "$dir" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + || { print -u2 "symcache-prune: delete failed in $dir"; return 1; }
+  after=${$(du -skx -- "$dir")[1]}
+  [[ $after == <-> ]] || after=0
+  print -r -- "$(date -u +%Y-%m-%dT%H:%M:%SZ) before=$(( before / 1024 ))MB freed=$(( (before - after) / 1024 ))MB" >> "$log"
+}
+
+# render_plist [threshold-gb]: prints the LaunchDaemon plist; the threshold argument is added only when one is given.
+render_plist() {
+  local threshold=$1
+  print -r -- '<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>'$label'</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>'$libexec'</string>
+    <string>run</string>'"${threshold:+
+    <string>$threshold</string>}"'
+  </array>
+  <key>StartInterval</key>
+  <integer>3600</integer>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>Nice</key>
+  <integer>10</integer>
+  <key>LowPriorityIO</key>
+  <true/>
+  <key>StandardErrorPath</key>
+  <string>'$log'</string>
+</dict>
+</plist>'
+}
+
+# usage: prints the command summary to stderr.
+usage() {
+  print -u2 "usage: symcache-prune run [threshold-gb] | install [threshold-gb] | uninstall | status | check
+  threshold: a whole number of GB, at least 1; default 10"
+}
+
+# need_root <subcommand> [arg]: exits 1 with the sudo command to use when not running as root.
+need_root() {
+  (( EUID == 0 )) && return 0
+  print -u2 "symcache-prune: $1 must run as root. Run: sudo $self $*"
+  exit 1
+}
+
+# safe_ancestors: fails unless every folder above the installed copy is root-owned and not group- or world-writable.
+safe_ancestors() {
+  local d
+  for d in ${libexec:h} /usr/local /usr; do
+    if [[ $(stat -f %u $d) != 0 ]] || (( $(stat -f %Lp $d) & 8#022 )); then
+      print -u2 "symcache-prune: refusing: $d is not root-owned or is writable by others"
+      return 1
+    fi
+  done
+}
+
+# do_install [threshold-gb]: copies this script to a root-owned path and loads the hourly job.
+do_install() {
+  local threshold=$1 source_script=$self tmp
+  [[ -f $source_script ]] || { print -u2 "symcache-prune: missing $source_script"; return 1; }
+  # A root job must never run a file a user can edit, so it runs a root-owned copy, not the downloaded script.
+  mkdir -p ${libexec:h} || return 1
+  # On some Macs /usr/local belongs to the user (e.g. Intel Homebrew); a user could then swap the copy.
+  safe_ancestors || return 1
+  install -o root -g wheel -m 755 $source_script $libexec || return 1
+  print "installed $libexec (root:wheel 755)"
+
+  tmp=$(mktemp /tmp/symcache-prune.plist.XXXXXX) || return 1
+  render_plist $threshold > $tmp
+  plutil -lint -s $tmp || { rm -f $tmp; return 1; }
+  launchctl bootout system/$label 2>/dev/null && print "unloaded the previous $label"
+  install -o root -g wheel -m 644 $tmp $plist || { rm -f $tmp; return 1; }
+  rm -f $tmp
+  print "wrote $plist (root:wheel 644, hourly, threshold ${threshold:-10} GB)"
+  launchctl bootstrap system $plist || return 1
+  print "loaded $label (runs now, then every hour; prunes are logged to $log)"
+}
+
+# do_uninstall: unloads the job and removes the plist, the installed copy and the log.
+do_uninstall() {
+  launchctl bootout system/$label 2>/dev/null && print "unloaded $label" || print "$label was not loaded"
+  rm -f -- $plist $libexec $log
+  print "removed $plist, $libexec, $log"
+}
+
+# do_status: reports whether the job is loaded, the last log lines, and the cache size when root.
+do_status() {
+  if launchctl print system/$label >/dev/null 2>&1; then
+    print "job:   $label is loaded"
+  else
+    print "job:   $label is not loaded"
+  fi
+  if [[ -r $log ]]; then
+    print "log:   $log (last 5 lines)"
+    tail -n 5 -- $log
+  else
+    print "log:   $log does not exist yet (nothing pruned)"
+  fi
+  if (( EUID == 0 )); then
+    print "cache: $(du -shx -- $cache 2>/dev/null | cut -f1) in $cache"
+  else
+    print "cache: size needs root. Run: sudo du -sh $cache"
+  fi
+}
+
+# do_check: prints the size command and what it shows.
+do_check() {
+  print "sudo du -sh $cache"
+  print
+  print "Shows how much disk the coresymbolicationd cache uses. The folder is readable only by root, so du needs"
+  print "sudo; it reads sizes and changes nothing. macOS counts this space under \"System Data\" in Storage settings."
+}
+
+# Only the executed script acts; sourcing (the test) defines the functions and stops.
+if [[ $ZSH_EVAL_CONTEXT == toplevel ]]; then
+  cmd=$1; (( $# )) && shift
+  case $cmd in
+    run|install)
+      if [[ $# -gt 1 || ( -n $1 && $1 != <1-> ) ]]; then usage; exit 2; fi ;;
+    uninstall|status|check)
+      if (( $# )); then usage; exit 2; fi ;;
+    *) usage; exit 2 ;;
+  esac
+  case $cmd in
+    run)
+      symcache_prune $cache $(( ${1:-10} * 1024 * 1024 )) $log; exit $? ;;
+    install) need_root install $1; do_install $1; exit $? ;;
+    uninstall) need_root uninstall; do_uninstall; exit $? ;;
+    status) do_status; exit $? ;;
+    check) do_check; exit 0 ;;
+  esac
+fi
